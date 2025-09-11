@@ -1,5 +1,5 @@
 echo "starting script"
-cp /boot/firmware/config.txt ./config/config.txt
+cp /boot/firmware/config.txt ./configw/config.txt
 hostname -I | awk '{print $1}' > ./ip.md
 git add .
 git commit -m"updated config files and ip"
