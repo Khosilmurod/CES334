@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🌱 Plant Guardian</title>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #444;
+            color: white;
+            overflow: hidden;
+        }
+        
+        #threejs-viewport {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        
+        .plant-status {
+            position: fixed;
+            bottom: 24px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 12px;
+            background: none;
+            border: none;
+            z-index: 1000;
+        }
+        
+        .sensor-buttons div {
+            background: rgba(0, 0, 0, 0.5);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            color: white;
+            font-size: 16px;
+            font-weight: 600;
+            padding: 10px 20px;
+            border-radius: 8px;
+            transition: all 0.2s ease;
+            text-align: center;
+            min-width: 120px;
+        }
+        
+        .status-dead {
+            background: rgba(239, 68, 68, 0.12);
+            border-color: rgba(239, 68, 68, 0.2);
+            box-shadow: 
+                0 8px 32px rgba(239, 68, 68, 0.15),
+                inset 0 1px 0 rgba(255, 255, 255, 0.1);
+        }
+        
+        .status-active {
+            background: rgba(59, 130, 246, 0.12);
+            border-color: rgba(59, 130, 246, 0.2);
+            box-shadow: 
+                0 8px 32px rgba(59, 130, 246, 0.15),
+                inset 0 1px 0 rgba(255, 255, 255, 0.1);
+        }
+    </style>
+</head>
+<body>
+    <canvas id="threejs-viewport"></canvas>
+    
+    <!-- Model Selector Dropdown -->
+    <div style="position: fixed; top: 24px; right: 24px; z-index: 1000;">
+        <select id="model-selector" style="
+            background: rgba(0, 0, 0, 0.7);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            color: white;
+            font-size: 16px;
+            font-weight: 600;
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            outline: none;
+        ">
+            <option value="zombie">🧟 Zombie</option>
+            <option value="mutant">👹 Mutant</option>
+        </select>
+    </div>
+    
+    <div class="plant-status" id="plant-status">
+        <div class="sensor-buttons">
+            <div id="state-display">🌿 Loading...</div>
+            <div id="moisture-display">💧 Connecting...</div>
+        </div>
+    </div>
+    
+    <!-- Socket.IO for real-time communication -->
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+
+    <script>
+        // Plant Guardian States
+        const states = {
+            IDLE: 'idle',
+            DEAD: 'dead', 
+            SWIPE: 'swipe'
+        };
+        
+        // Sensor thresholds
+        const MOISTURE_DEATH_THRESHOLD = 1500; // Raw sensor value: below 1500 = dead
+        const REVIVE_DURATION = 5000; // 5 seconds of idle before dying again
+        
+        // Current state
+        let currentState = states.IDLE;
+        let moistureLevel = 60; // Start at 60% (safe level with new logic)
+        let rawMoistureValue = 0; // Raw sensor value from ESP32 (0-4095)
+        let lastTapTime = 0;
+        let isDead = false;
+        let reviveTimer = null; // Timer for temporary revival
+        
+        // Idle sequence tracking
+        let idleSequenceIndex = 0;
+        const idleSequence = ['idle_breathing', 'idle', 'idle_breathing']; // Standing -> Dance -> Standing
+        let isPlayingIdleSequence = false;
+        
+        // Three.js Scene Setup
+        let scene, camera, renderer, model, mixer, clock;
+        let actions = {};
+        let currentAction = null;
+        let socket = null; // Socket.IO connection
+        let currentModel = 'zombie'; // Track current model type
+        
+        // Animation blending
+        let isBlending = false;
+        let blendStartTime = 0;
+        let blendDuration = 0.3; // 300ms blend time
+        let fromAction = null;
+        let toAction = null;
+        
+        function smoothBlend(from, to, duration) {
+            if (from === to) return;
+            
+            isBlending = true;
+            blendStartTime = performance.now();
+            blendDuration = duration * 1000; // Convert to milliseconds
+            fromAction = from;
+            toAction = to;
+            
+            // Ensure BOTH actions are enabled and playing
+            if (fromAction) {
+                fromAction.enabled = true;
+                fromAction.setEffectiveWeight(1.0);
+                fromAction.play();
+            }
+            if (toAction) {
+                toAction.enabled = true;
+                toAction.setEffectiveWeight(0.0);
+                toAction.play();
+            }
+        }
+        
+        function updateBlending() {
+            if (!isBlending) return;
+            
+            const now = performance.now();
+            const elapsed = now - blendStartTime;
+            const progress = Math.min(elapsed / blendDuration, 1.0);
+            
+            // Smooth easing function (ease-in-out)
+            const eased = progress < 0.5 
+                ? 2 * progress * progress 
+                : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+            
+            if (fromAction) {
+                fromAction.setEffectiveWeight(1 - eased);
+            }
+            if (toAction) {
+                toAction.setEffectiveWeight(eased);
+            }
+            
+            // Finish blending
+            if (progress >= 1.0) {
+                isBlending = false;
+                if (fromAction) {
+                    fromAction.setEffectiveWeight(0);
+                    // Keep enabled but at 0 weight for smooth future transitions
+                }
+                if (toAction) {
+                    toAction.setEffectiveWeight(1);
+                }
+            }
+        }
+        
+        function init() {
+            // EXACT COPY from working debug viewer
+            const canvas = document.getElementById('threejs-viewport');
+            
+            // Scene  
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x2a2a2a); // Darkish gray background
+            
+            // Camera (zoomed in closer)
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 2, 3);
+            
+            // Renderer with better color output
+            renderer = new THREE.WebGLRenderer({ 
+                canvas: canvas,
+                antialias: true
+            });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.outputEncoding = THREE.sRGBEncoding; // Proper color encoding
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 1.0; // Normal exposure (was too bright at 1.5)
+            
+            // Enhanced Lights for better zombie visibility
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.8); // Brighter ambient
+            scene.add(ambientLight);
+            
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 1.2); // Brighter directional
+            directionalLight.position.set(5, 10, 5);
+            scene.add(directionalLight);
+            
+            // Add a second light from the front
+            const frontLight = new THREE.DirectionalLight(0xffffff, 0.6);
+            frontLight.position.set(0, 5, 10);
+            scene.add(frontLight);
+            
+            // Ground - darker color
+            const groundGeometry = new THREE.PlaneGeometry(10, 10);
+            const groundMaterial = new THREE.MeshLambertMaterial({ color: 0x1a1a1a }); // Much darker ground
+            const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+            ground.rotation.x = -Math.PI / 2;
+            scene.add(ground);
+            
+            // Load model
+            loadModel(currentModel);
+            
+            // Set up model selector dropdown
+            const modelSelector = document.getElementById('model-selector');
+            modelSelector.value = currentModel;
+            modelSelector.addEventListener('change', function(e) {
+                currentModel = e.target.value;
+                console.log(`🔄 Switching to ${currentModel} model...`);
+                loadModel(currentModel);
+            });
+            
+            // Animation loop
+            animate();
+            
+            // Clock for animations
+            clock = new THREE.Clock();
+            
+            // Handle window resize
+            window.addEventListener('resize', onWindowResize, false);
+        }
+        
+        function loadModel(modelType = 'zombie') {
+            const loader = new THREE.GLTFLoader();
+            const modelPath = modelType === 'zombie' ? '/web_assets/zombie.gltf' : '/web_assets/npc.gltf';
+            
+            console.log(`📦 Loading ${modelType} model...`);
+            
+            loader.load(modelPath, function(gltf) {
+                console.log(`📦 ${modelType} model loaded successfully`);
+                
+                // Remove old model if exists
+                if (model) {
+                    scene.remove(model);
+                    if (mixer) mixer.stopAllAction();
+                }
+                
+                // Reset actions
+                actions = {};
+                currentAction = null;
+                isPlayingIdleSequence = false;
+                
+                model = gltf.scene;
+                
+                // Scale based on model type
+                const scale = modelType === 'zombie' ? 1.6 : 2; // Zombie smaller (1.6), Mutant normal (2)
+                model.scale.setScalar(scale);
+                
+                // Try different rotations to stand upright and face camera
+                model.rotation.x = 0;
+                model.rotation.y = 0; // No Y rotation - should face forward now
+                model.rotation.z = 0;
+                
+                // Position properly on ground
+                const box = new THREE.Box3().setFromObject(model);
+                model.position.x = 0;
+                model.position.z = 0;
+                model.position.y = -box.min.y; // Bottom of model at ground level
+                
+                console.log(`Fixed scale: ${scale} for ${modelType}`);
+                
+                // Make it VERY bright and visible
+                let meshCount2 = 0;
+                model.traverse(function(child) {
+                    console.log("Traversing child:", child.type, child.name);
+                    if (child.isMesh) {
+                        meshCount2++;
+                        console.log(`Found mesh ${meshCount2}:`, child.name, "Vertices:", child.geometry.attributes.position.count);
+                        
+                        // Force visibility
+                        child.visible = true;
+                        child.frustumCulled = false;
+                        
+                        // Enhance material brightness
+                        if (child.material) {
+                            console.log(`Material type: ${child.material.type}`);
+                            
+                            // For PBR materials (MeshStandardMaterial)
+                            if (child.material.isMeshStandardMaterial) {
+                                // Different emissive settings based on model type
+                                if (modelType === 'mutant') {
+                                    // Mutant: minimal emissive for darker appearance
+                                    child.material.emissive = new THREE.Color(0x000000); // No glow
+                                    child.material.emissiveIntensity = 0;
+                                } else {
+                                    // Zombie: subtle emissive to prevent it being too dark
+                                    child.material.emissive = new THREE.Color(0x111111);
+                                    child.material.emissiveIntensity = 0.2;
+                                }
+                                
+                                // Keep original metalness and roughness for realistic look
+                                if (child.material.metalness === undefined) child.material.metalness = 0;
+                                if (child.material.roughness === undefined) child.material.roughness = 0.8;
+                            }
+                            
+                            // Ensure double-sided rendering
+                            child.material.side = THREE.DoubleSide;
+                            child.material.needsUpdate = true;
+                            
+                            console.log(`Enhanced material for: ${child.name}`);
+                        }
+                    }
+                });
+                
+                console.log(`Total meshes found and processed: ${meshCount2}`);
+                
+                scene.add(model);
+                
+                // Set up animations - works for both Zombie and Mutant
+                if (gltf.animations && gltf.animations.length > 0) {
+                    mixer = new THREE.AnimationMixer(model);
+                    
+                    gltf.animations.forEach((clip) => {
+                        const action = mixer.clipAction(clip);
+                        const name = clip.name.toLowerCase();
+                        
+                        console.log(`🎬 Found animation: "${clip.name}" (${clip.tracks.length} tracks)`);
+                        
+                        // Map animations to our action names (works for both models)
+                        if (name.includes('die')) {
+                            actions['die'] = action;
+                            action.setLoop(THREE.LoopOnce);
+                            action.clampWhenFinished = true;
+                            console.log(`   ✅ Mapped to: die`);
+                        } 
+                        else if (name === 'idle_animation' || name.includes('idle_animation')) {
+                            actions['idle'] = action;
+                            action.setLoop(THREE.LoopRepeat);
+                            action.clampWhenFinished = false;
+                            console.log(`   ✅ Mapped to: idle`);
+                        } 
+                        else if (name === 'idle_breathing_animation' || name.includes('breathing') || name.includes('layer0.001')) {
+                            actions['idle_breathing'] = action;
+                            action.setLoop(THREE.LoopRepeat);
+                            action.clampWhenFinished = false;
+                            console.log(`   ✅ Mapped to: idle_breathing`);
+                        } 
+                        else if (name === 'swipe_animation' || name.includes('swipe')) {
+                            actions['swipe'] = action;
+                            action.setLoop(THREE.LoopOnce);
+                            action.clampWhenFinished = false; // Don't clamp for smooth blend out
+                            console.log(`   ✅ Mapped to: swipe`);
+                        }
+                    });
+                    
+                    // Start all animations at weight 0 for smooth crossfading
+                    Object.values(actions).forEach(action => {
+                        action.play();
+                        action.setEffectiveWeight(0);
+                        action.enabled = true;
+                    });
+                    
+                    // Start with idle sequence
+                    console.log('🎬 Available animations:', Object.keys(actions));
+                    console.log('🎬 Animation details:');
+                    Object.keys(actions).forEach(key => {
+                        console.log(`  ${key}: ${actions[key].getClip().name} (${actions[key].getClip().duration.toFixed(2)}s)`);
+                    });
+                    playAnimation('idle');
+                }
+                
+            }, undefined, function(error) {
+                console.error('Error loading model:', error);
+            });
+        }
+        
+        function playAnimation(animationName) {
+            console.log(`🎬 playAnimation("${animationName}") called - Current state: ${currentState}`);
+            
+            // Handle idle sequence specially
+            if (animationName === 'idle') {
+                startIdleSequence();
+                return;
+            }
+            
+            // Stop idle sequence for non-idle animations
+            isPlayingIdleSequence = false;
+            
+            if (!mixer || !actions[animationName]) {
+                console.log(`❌ Cannot play animation: mixer=${!!mixer}, action exists=${!!actions[animationName]}`);
+                return;
+            }
+            
+            const newAction = actions[animationName];
+            
+            // Update state immediately based on animation
+            if (animationName === 'swipe') {
+                currentState = states.SWIPE;
+                console.log(`✅ State changed to SWIPE`);
+            } else if (animationName === 'die') {
+                currentState = states.DEAD;
+                isDead = true;
+                console.log(`✅ State changed to DEAD`);
+            }
+            
+            // Clear any switch timer from previous action
+            if (currentAction && currentAction.switchTimer) {
+                clearTimeout(currentAction.switchTimer);
+                currentAction.switchTimer = null;
+            }
+            
+            // Clear any blend timer from previous action
+            if (currentAction && currentAction.blendTimer) {
+                clearTimeout(currentAction.blendTimer);
+                currentAction.blendTimer = null;
+            }
+            
+            // For one-shot animations, reset them
+            if (animationName === 'swipe') {
+                newAction.reset();
+                newAction.time = 0;
+                newAction.enabled = true;
+                newAction.setLoop(THREE.LoopOnce);
+                newAction.clampWhenFinished = false; // Don't clamp - smooth blend out
+            } else if (animationName === 'die') {
+                newAction.reset();
+                newAction.time = 0;
+                newAction.enabled = true;
+                newAction.setLoop(THREE.LoopOnce);
+                newAction.clampWhenFinished = true; // Clamp to hold dead pose
+            }
+            
+            // Smooth blend from current to new action
+            // Use faster blend when coming from swipe (0.3s for swipe itself, 0.5s when transitioning from swipe)
+            let blendTime = 0.7; // Default for normal transitions
+            if (animationName === 'swipe') {
+                blendTime = 0.3; // Fast blend into swipe
+            } else if (animationName === 'die' && currentAction === actions['swipe']) {
+                blendTime = 0.5; // Faster blend from swipe to die
+            }
+            
+            smoothBlend(currentAction, newAction, blendTime);
+            
+            currentAction = newAction;
+            
+            // Set up animation finished listener for swipe animation
+            if (animationName === 'swipe') {
+                // Calculate when to start blending to next animation (before swipe fully finishes)
+                const swipeDuration = newAction.getClip().duration * 1000; // Convert to ms
+                const blendStartOffset = 500; // Start blending 500ms before swipe ends (earlier!)
+                
+                const blendTimer = setTimeout(() => {
+                    console.log('✅ Swipe animation about to finish - starting blend to next state');
+                    checkMoistureLevel();
+                }, Math.max(0, swipeDuration - blendStartOffset));
+                
+                // Store timer to clean up if needed
+                newAction.blendTimer = blendTimer;
+            }
+            
+            updateUI();
+        }
+        
+        function startIdleSequence() {
+            console.log('🔄 Starting idle sequence');
+            isPlayingIdleSequence = true;
+            idleSequenceIndex = 0;
+            currentState = states.IDLE;
+            isDead = false;
+            playNextIdleAnimation();
+        }
+        
+        function playNextIdleAnimation() {
+            if (!isPlayingIdleSequence) return;
+            
+            const animName = idleSequence[idleSequenceIndex];
+            console.log(`🎭 Playing idle sequence ${idleSequenceIndex + 1}/3: ${animName}`);
+            
+            if (!actions[animName]) {
+                console.error(`❌ Animation not found: ${animName}`);
+                return;
+            }
+            
+            const newAction = actions[animName];
+            
+            // Clear any existing switch timer
+            if (currentAction && currentAction.switchTimer) {
+                clearTimeout(currentAction.switchTimer);
+                currentAction.switchTimer = null;
+            }
+            
+            // Use faster blend when transitioning from swipe (0.5s), shorter for idle-to-idle (0.5s)
+            const wasSwipe = currentAction === actions['swipe'];
+            const blendTime = wasSwipe ? 0.5 : 0.5; // Faster idle-to-idle transitions
+            
+            // Set weights: new action to 1, all others to 0
+            smoothBlend(currentAction, newAction, blendTime);
+            
+            currentAction = newAction;
+            
+            // Set up timer to switch to next animation BEFORE it ends (overlap for smooth transition)
+            const animationDuration = 4000; // 4 seconds per idle animation
+            const blendStartOffset = 500; // Start blending 500ms before switching
+            
+            const switchTimer = setTimeout(() => {
+                if (isPlayingIdleSequence) {
+                    // Move to next in sequence
+                    idleSequenceIndex = (idleSequenceIndex + 1) % idleSequence.length;
+                    playNextIdleAnimation();
+                }
+            }, animationDuration - blendStartOffset); // Start blend earlier
+            
+            // Store timer so we can clear it if needed
+            currentAction.switchTimer = switchTimer;
+            
+            updateUI();
+        }
+        
+        function updateUI() {
+            const stateDisplay = document.getElementById('state-display');
+            const moistureDisplay = document.getElementById('moisture-display');
+            
+            // Update state display
+            if (currentState === states.DEAD || currentState === 'die') {
+                stateDisplay.textContent = '💀 Dead';
+                stateDisplay.style.borderColor = 'rgba(239, 68, 68, 0.5)';
+            } else if (currentState === states.SWIPE || currentState === 'swipe') {
+                stateDisplay.textContent = '⚔️ Defending';
+                stateDisplay.style.borderColor = 'rgba(234, 179, 8, 0.5)';
+            } else {
+                stateDisplay.textContent = '🌿 Alive';
+                stateDisplay.style.borderColor = 'rgba(34, 197, 94, 0.5)';
+            }
+            
+            // Update moisture display with raw sensor value
+            moistureDisplay.textContent = `${rawMoistureValue} 💧`;
+            console.log(`🎨 UI updated - State: ${currentState}, Moisture: ${rawMoistureValue} 💧`);
+        }
+        
+        function handleTap() {
+            console.log(`🎯 handleTap() - Current State: ${currentState}, Moisture: ${moistureLevel}%`);
+            
+            // Always play swipe animation on tap
+            playAnimation('swipe');
+        }
+        
+        function checkMoistureLevel() {
+            console.log(`🔍 Checking moisture: ${rawMoistureValue} raw (${moistureLevel.toFixed(1)}%) - threshold: ${MOISTURE_DEATH_THRESHOLD}`);
+            console.log(`🔍 Current state: ${currentState}, isDead: ${isDead}`);
+            
+            if (rawMoistureValue < MOISTURE_DEATH_THRESHOLD) {
+                // Moisture is low (< 1500 raw) - should be dead
+                if (currentState !== states.DEAD && currentState !== 'die') {
+                    console.log(`💀 Moisture LOW (${rawMoistureValue} < ${MOISTURE_DEATH_THRESHOLD}) - transitioning to DEAD state`);
+                    isDead = true;
+                    playAnimation('die');
+                }
+            } else {
+                // Moisture is good (>= 1500 raw) - should be alive/idle
+                if (currentState !== states.IDLE && currentState !== 'idle') {
+                    console.log(`🌱 Moisture GOOD (${rawMoistureValue} >= ${MOISTURE_DEATH_THRESHOLD}) - transitioning to IDLE state`);
+                    isDead = false;
+                    playAnimation('idle');
+                }
+            }
+        }
+        
+        // Button event listeners
+        function setupButtons() {
+            // No buttons anymore - just display divs
+            console.log('📊 Display elements initialized');
+        }
+        
+        // Controls
+        document.addEventListener('keydown', function(event) {
+            // Tap controls disabled - only sensor can trigger
+            // Space and Enter keys disabled for production
+        });
+        
+        // Mouse wheel zoom
+        document.getElementById('threejs-viewport').addEventListener('wheel', function(event) {
+            event.preventDefault();
+            const zoomSpeed = 0.1;
+            const direction = event.deltaY > 0 ? 1 : -1;
+            
+            camera.position.z += direction * zoomSpeed;
+            camera.position.z = Math.max(1.5, Math.min(8, camera.position.z)); // Clamp zoom (closer limits)
+        });
+        
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            // Update blending
+            updateBlending();
+            
+            // Update animations
+            if (mixer) {
+                mixer.update(clock.getDelta());
+            }
+            
+            renderer.render(scene, camera);
+        }
+        
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+        
+        // Initialize when page loads
+        window.addEventListener('load', function() {
+            console.log('🌱 Plant Guardian initializing...');
+            init();
+            setupButtons();
+            setupSocketIO();
+            
+            // Test socket connection after 2 seconds
+            setTimeout(() => {
+                if (socket && socket.connected) {
+                    console.log('✅ Socket is connected:', socket.id);
+                    console.log('✅ Transport:', socket.io.engine.transport.name);
+                } else {
+                    console.error('❌ Socket is NOT connected!');
+                    console.error('Socket exists?', !!socket);
+                    if (socket) {
+                        console.error('Socket connected?', socket.connected);
+                        console.error('Socket disconnected?', socket.disconnected);
+                    }
+                }
+            }, 2000);
+            
+            console.log('🌱 Plant Guardian initialized - waiting for sensor data...');
+        });
+        
+        // Socket.IO connection for real-time MQTT data
+        function setupSocketIO() {
+            console.log('🔌 Setting up Socket.IO connection...');
+            
+            // Create socket connection with explicit options
+            socket = io({
+                transports: ['websocket', 'polling'],
+                reconnection: true,
+                reconnectionDelay: 1000,
+                reconnectionAttempts: 5
+            });
+            
+            socket.on('connect', function() {
+                console.log('✅ Connected to server - Socket ID:', socket.id);
+                console.log('🔗 Transport:', socket.io.engine.transport.name);
+            });
+            
+            socket.on('connect_error', function(error) {
+                console.error('❌ Connection error:', error.message);
+            });
+            
+            socket.on('disconnect', function(reason) {
+                console.log('❌ Disconnected:', reason);
+            });
+            
+            // Debug: Log ALL Socket.IO events
+            socket.onAny((eventName, ...args) => {
+                console.log(`🔔 Event: "${eventName}"`, args);
+            });
+            
+            // Handle moisture updates
+            socket.on('moisture_update', function(data) {
+                console.log(`💧 MOISTURE UPDATE:`, data);
+                
+                if (!data || data.value === undefined) {
+                    console.error('❌ Invalid moisture data received');
+                    return;
+                }
+                
+                // Store raw sensor value and percentage
+                rawMoistureValue = data.value;
+                moistureLevel = data.percent;
+                
+                console.log(`✅ Updated: rawMoistureValue=${rawMoistureValue}, moistureLevel=${moistureLevel}%`);
+                
+                // Check if state changed
+                if (data.changed) {
+                    console.log('🔄 State changed - checking moisture level');
+                    checkMoistureLevel();
+                }
+                
+                updateUI();
+            });
+            
+            // Handle tap events  
+            socket.on('tap_event', function(data) {
+                console.log('='.repeat(60));
+                console.log('💥 TAP EVENT RECEIVED!');
+                console.log('📦 Data:', data);
+                console.log('🎭 Current State:', currentState);
+                console.log('💧 Moisture:', moistureLevel + '%');
+                console.log('='.repeat(60));
+                
+                // Trigger tap animation immediately
+                handleTap();
+            });
+            
+            console.log('✅ Socket.IO handlers registered');
+        }
+    </script>
+</body>
+</html>

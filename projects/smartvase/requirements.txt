@@ -1,0 +1,13 @@
+# Plant Guardian Web Viewer Requirements
+# Install with: pip install -r requirements.txt
+
+# Flask web framework
+flask
+flask-socketio
+
+# MQTT communication
+paho-mqtt
+
+# WebSocket support
+python-socketio
+eventlet

@@ -1,0 +1,1 @@
+I have a problem with essentially connecting to my esp32
